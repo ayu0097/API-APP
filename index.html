@@ -32,7 +32,8 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 
     <script>
-      tailwind.config = {
+      window.tailwind = window.tailwind || {};
+      window.tailwind.config = {
         theme: {
           extend: {
             colors: {
@@ -1461,52 +1462,116 @@
         };
 
         // ==========================================
-        // 4. INDEXEDDB PERSISTENCE (Threads, Artifacts, Thinking)
+        // 3b. SAFE STORAGE & ICON REFRESH HELPERS
+        // ==========================================
+        const SafeStorage = {
+          getItem: (key) => {
+            try {
+              return (typeof window !== 'undefined' && window.localStorage) ? window.SafeStorage.getItem(key) : null;
+            } catch (_) {
+              return null;
+            }
+          },
+          setItem: (key, val) => {
+            try {
+              if (typeof window !== 'undefined' && window.localStorage) window.SafeStorage.setItem(key, val);
+            } catch (_) {}
+          },
+          removeItem: (key) => {
+            try {
+              if (typeof window !== 'undefined' && window.localStorage) window.SafeStorage.removeItem(key);
+            } catch (_) {}
+          }
+        };
+
+        function refreshIcons() {
+          if (typeof lucide !== 'undefined' && lucide && typeof lucide.createIcons === 'function') {
+            try { refreshIcons(); } catch (_) {}
+          }
+        }
+
+        // ==========================================
+        // 4. INDEXEDDB PERSISTENCE (With Safe Fallback)
         // ==========================================
         const DB_NAME = 'claude_mobile_workbench_db';
         const DB_VERSION = 1;
         let dbInstance = null;
 
         function initIndexedDB() {
-          return new Promise((resolve, reject) => {
-            const req = indexedDB.open(DB_NAME, DB_VERSION);
-            req.onupgradeneeded = (e) => {
-              const db = e.target.result;
-              if (!db.objectStoreNames.contains('chats')) {
-                db.createObjectStore('chats', { keyPath: 'id' });
+          return new Promise((resolve) => {
+            try {
+              if (typeof window === 'undefined' || !window.indexedDB) {
+                return resolve(null);
               }
-              if (!db.objectStoreNames.contains('artifacts')) {
-                db.createObjectStore('artifacts', { keyPath: 'id' });
-              }
-              if (!db.objectStoreNames.contains('thinking_buffers')) {
-                db.createObjectStore('thinking_buffers', { keyPath: 'messageId' });
-              }
-              if (!db.objectStoreNames.contains('vault_store')) {
-                db.createObjectStore('vault_store', { keyPath: 'id' });
-              }
-            };
-            req.onsuccess = (e) => {
-              dbInstance = e.target.result;
-              resolve(dbInstance);
-            };
-            req.onerror = (e) => reject(e);
+              const req = indexedDB.open(DB_NAME, DB_VERSION);
+              req.onupgradeneeded = (e) => {
+                try {
+                  const db = e.target.result;
+                  if (!db.objectStoreNames.contains('chats')) {
+                    db.createObjectStore('chats', { keyPath: 'id' });
+                  }
+                  if (!db.objectStoreNames.contains('artifacts')) {
+                    db.createObjectStore('artifacts', { keyPath: 'id' });
+                  }
+                  if (!db.objectStoreNames.contains('thinking_buffers')) {
+                    db.createObjectStore('thinking_buffers', { keyPath: 'messageId' });
+                  }
+                  if (!db.objectStoreNames.contains('vault_store')) {
+                    db.createObjectStore('vault_store', { keyPath: 'id' });
+                  }
+                } catch (_) {}
+              };
+              req.onsuccess = (e) => {
+                dbInstance = e.target.result;
+                resolve(dbInstance);
+              };
+              req.onerror = () => resolve(null);
+              req.onblocked = () => resolve(null);
+            } catch (_) {
+              resolve(null);
+            }
           });
         }
 
         async function saveChatToDB(chat) {
-          if (!dbInstance) return;
-          const tx = dbInstance.transaction('chats', 'readwrite');
-          tx.objectStore('chats').put(chat);
+          try {
+            if (dbInstance) {
+              const tx = dbInstance.transaction('chats', 'readwrite');
+              tx.objectStore('chats').put(chat);
+            }
+          } catch (_) {}
+          try {
+            const stored = SafeStorage.getItem('claude_chats_backup');
+            let list = stored ? JSON.parse(stored) : [];
+            const idx = list.findIndex(c => c.id === chat.id);
+            if (idx >= 0) list[idx] = chat;
+            else list.unshift(chat);
+            SafeStorage.setItem('claude_chats_backup', JSON.stringify(list.slice(0, 30)));
+          } catch (_) {}
         }
 
         async function loadAllChatsFromDB() {
-          if (!dbInstance) return [];
-          return new Promise((resolve) => {
-            const tx = dbInstance.transaction('chats', 'readonly');
-            const req = tx.objectStore('chats').getAll();
-            req.onsuccess = () => resolve(req.result || []);
-            req.onerror = () => resolve([]);
-          });
+          if (dbInstance) {
+            try {
+              return await new Promise((resolve) => {
+                const tx = dbInstance.transaction('chats', 'readonly');
+                const req = tx.objectStore('chats').getAll();
+                req.onsuccess = () => resolve(req.result || []);
+                req.onerror = () => {
+                  try {
+                    const b = SafeStorage.getItem('claude_chats_backup');
+                    resolve(b ? JSON.parse(b) : []);
+                  } catch (_) { resolve([]); }
+                };
+              });
+            } catch (_) {}
+          }
+          try {
+            const b = SafeStorage.getItem('claude_chats_backup');
+            return b ? JSON.parse(b) : [];
+          } catch (_) {
+            return [];
+          }
         }
 
         // ==========================================
@@ -1515,32 +1580,32 @@
         const AppState = {
           currentChatId: null,
           chats: [],
-          activeModel: localStorage.getItem('claude_active_model') || (() => {
+          activeModel: SafeStorage.getItem('claude_active_model') || (() => {
             try {
-              const saved = localStorage.getItem('claude_custom_models');
+              const saved = SafeStorage.getItem('claude_custom_models');
               const list = saved ? JSON.parse(saved) : [];
               return list[0]?.id || '';
             } catch (_) { return ''; }
           })(),
-          theme: localStorage.getItem('claude_theme') || 'dark', // 'dark' | 'white'
-          webSearchEnabled: localStorage.getItem('claude_web_search_enabled') === 'true',
-          contextMode: localStorage.getItem('claude_context_mode') || 'pro', // 'very_fast' | 'pdf_accuracy' | 'pro' | 'xhigh'
-          contextWindowLimit: parseInt(localStorage.getItem('claude_context_window') || '128000', 10),
-          detectedModelCapacity: parseInt(localStorage.getItem('claude_detected_model_capacity') || '200000', 10),
-          thinkingBudget: parseInt(localStorage.getItem('claude_thinking_budget') || '8000', 10),
+          theme: SafeStorage.getItem('claude_theme') || 'dark', // 'dark' | 'white'
+          webSearchEnabled: SafeStorage.getItem('claude_web_search_enabled') === 'true',
+          contextMode: SafeStorage.getItem('claude_context_mode') || 'pro', // 'very_fast' | 'pdf_accuracy' | 'pro' | 'xhigh'
+          contextWindowLimit: parseInt(SafeStorage.getItem('claude_context_window') || '128000', 10),
+          detectedModelCapacity: parseInt(SafeStorage.getItem('claude_detected_model_capacity') || '200000', 10),
+          thinkingBudget: parseInt(SafeStorage.getItem('claude_thinking_budget') || '8000', 10),
           vault: {
             unlocked: true,
-            anthropicKey: localStorage.getItem('claude_anthropic_key') || '',
-            openaiKey: localStorage.getItem('claude_openai_key') || '',
-            githubKey: localStorage.getItem('claude_github_key') || '',
-            searchKey: localStorage.getItem('claude_search_key') || '',
-            customBaseUrl: localStorage.getItem('claude_custom_base_url') || '',
-            customApiKey: localStorage.getItem('claude_custom_api_key') || '',
-            customFormat: localStorage.getItem('claude_custom_format') || 'openai'
+            anthropicKey: SafeStorage.getItem('claude_anthropic_key') || '',
+            openaiKey: SafeStorage.getItem('claude_openai_key') || '',
+            githubKey: SafeStorage.getItem('claude_github_key') || '',
+            searchKey: SafeStorage.getItem('claude_search_key') || '',
+            customBaseUrl: SafeStorage.getItem('claude_custom_base_url') || '',
+            customApiKey: SafeStorage.getItem('claude_custom_api_key') || '',
+            customFormat: SafeStorage.getItem('claude_custom_format') || 'openai'
           },
           customModels: (() => {
             try {
-              const saved = localStorage.getItem('claude_custom_models');
+              const saved = SafeStorage.getItem('claude_custom_models');
               return saved ? JSON.parse(saved) : [];
             } catch (_) {
               return [];
@@ -1551,15 +1616,15 @@
           activeView: 'chat', // 'chat' | 'workbench' | 'devops'
           activeStreams: new Map(), // chatId -> { abortController, startTime, assistantMsgId, tps, status } (Max 7 limit)
           currentAttachments: [], // [{ id, name, dataUrl, mediaType }]
-          systemPrompt: localStorage.getItem('claude_system_prompt') || 'You are Claude, a world-class software architect. When asked to create code, web pages, prototypes, or user interfaces, you MUST ALWAYS provide the complete code as a single self-contained HTML file with embedded CSS and JavaScript (no external file dependencies or build tools). Always format it inside an ```html code block so it can be previewed live in the sandbox and downloaded as a standalone .html file.',
-          systemPersonaPreset: localStorage.getItem('claude_persona_preset') || 'single-html',
-          temperature: parseFloat(localStorage.getItem('claude_temp') || '0.7'),
-          topP: parseFloat(localStorage.getItem('claude_topp') || '0.95'),
-          maxTokens: parseInt(localStorage.getItem('claude_max_tokens') || '8192', 10),
+          systemPrompt: SafeStorage.getItem('claude_system_prompt') || 'You are Claude, a world-class software architect. When asked to create code, web pages, prototypes, or user interfaces, you MUST ALWAYS provide the complete code as a single self-contained HTML file with embedded CSS and JavaScript (no external file dependencies or build tools). Always format it inside an ```html code block so it can be previewed live in the sandbox and downloaded as a standalone .html file.',
+          systemPersonaPreset: SafeStorage.getItem('claude_persona_preset') || 'single-html',
+          temperature: parseFloat(SafeStorage.getItem('claude_temp') || '0.7'),
+          topP: parseFloat(SafeStorage.getItem('claude_topp') || '0.95'),
+          maxTokens: parseInt(SafeStorage.getItem('claude_max_tokens') || '8192', 10),
           gitRepos: [],
           gitBranches: [],
-          selectedRepo: localStorage.getItem('claude_selected_repo') || '',
-          selectedBranch: localStorage.getItem('claude_selected_branch') || 'main',
+          selectedRepo: SafeStorage.getItem('claude_selected_repo') || '',
+          selectedBranch: SafeStorage.getItem('claude_selected_branch') || 'main',
           consoleLogs: [],
           offlineQueue: [],
           longPressTarget: null
@@ -1764,6 +1829,40 @@
           }
         }
 
+
+        // ==========================================
+        // 7b. ATTACHMENT PREVIEW MANAGER
+        // ==========================================
+        function renderAttachmentPreviews() {
+          const previewContainer = document.getElementById('attached-images-preview');
+          if (!previewContainer) return;
+          if (!AppState.currentAttachments || AppState.currentAttachments.length === 0) {
+            previewContainer.innerHTML = '';
+            previewContainer.classList.add('hidden');
+            return;
+          }
+          previewContainer.classList.remove('hidden');
+          previewContainer.innerHTML = AppState.currentAttachments.map((att, idx) => `
+            <div class="relative group inline-flex items-center gap-1.5 px-2.5 py-1 bg-[#242421] border border-[#3D3B35] rounded-xl text-xs text-[#F5F4F0] animate-fadeIn">
+              ${att.mediaType && att.mediaType.startsWith('image') ? `
+                <img src="${att.url || ('data:' + att.mediaType + ';base64,' + att.base64)}" class="w-6 h-6 object-cover rounded-md border border-[#3D3B35]" />
+              ` : `
+                <i data-lucide="file-text" class="w-3.5 h-3.5 text-[#D97757]"></i>
+              `}
+              <span class="max-w-[130px] truncate text-[11px] font-mono">${escapeHtml(att.name || 'Attachment')}</span>
+              <button type="button" onclick="window.removeAttachment(${idx})" class="w-4 h-4 rounded-full bg-[#181817] hover:bg-rose-500 hover:text-white text-[#9C9A92] flex items-center justify-center text-[10px] ml-1 transition-colors" title="Remove attachment">&times;</button>
+            </div>
+          `).join('');
+          refreshIcons();
+        }
+
+        window.removeAttachment = function(idx) {
+          if (AppState.currentAttachments) {
+            AppState.currentAttachments.splice(idx, 1);
+            renderAttachmentPreviews();
+          }
+        };
+
         async function sendUserPrompt(promptText) {
           const trimmed = (promptText || '').trim();
           // If already generating in this chat, send button acts as abort/stop
@@ -1892,7 +1991,18 @@
             const customKey = (AppState.vault.customApiKey || '').trim();
 
             if (customUrl && (activeM?.isCustom || customKey || (!AppState.vault.anthropicKey && !AppState.vault.openaiKey))) {
-              await streamCustomEndpoint(chat, assistantMsg, promptText, activeM, signal);
+              try {
+                await streamCustomEndpoint(chat, assistantMsg, promptText, activeM, signal);
+              } catch (custErr) {
+                if (signal.aborted) return;
+                console.warn('Custom endpoint error:', custErr);
+                if (!customKey || custErr.message.includes('401') || custErr.message.includes('Failed to fetch')) {
+                  assistantMsg.content = `*(Notice: Custom endpoint error (${custErr.message}). Falling back to simulation mode - configure your endpoint API key in Settings.)*\n\n`;
+                  await streamSimulatedClaude(chat, assistantMsg, promptText, attachments, signal);
+                } else {
+                  throw custErr;
+                }
+              }
             } else if (AppState.vault.anthropicKey && modelId.startsWith('claude')) {
               await streamAnthropic(chat, assistantMsg, promptText, attachments, signal);
             } else if (AppState.vault.openaiKey) {
@@ -2467,7 +2577,7 @@ ${generatedHtml}
               document.getElementById('key-custom-base-url').value = baseUrl;
             }
             AppState.vault.customBaseUrl = baseUrl;
-            localStorage.setItem('claude_custom_base_url', baseUrl);
+            SafeStorage.setItem('claude_custom_base_url', baseUrl);
           }
 
           baseUrl = baseUrl.replace(/\/+$/, '');
@@ -2555,10 +2665,10 @@ ${generatedHtml}
                 }
               });
 
-              localStorage.setItem('claude_custom_models', JSON.stringify(AppState.customModels));
-              localStorage.setItem('claude_custom_base_url', baseUrl);
-              if (apiKey) localStorage.setItem('claude_custom_api_key', apiKey);
-              localStorage.setItem('claude_custom_format', format);
+              SafeStorage.setItem('claude_custom_models', JSON.stringify(AppState.customModels));
+              SafeStorage.setItem('claude_custom_base_url', baseUrl);
+              if (apiKey) SafeStorage.setItem('claude_custom_api_key', apiKey);
+              SafeStorage.setItem('claude_custom_format', format);
 
               AppState.vault.customBaseUrl = baseUrl;
               AppState.vault.customApiKey = apiKey;
@@ -2566,7 +2676,7 @@ ${generatedHtml}
 
               if (!AppState.activeModel || AppState.activeModel === '') {
                 AppState.activeModel = extractedList[0].id;
-                localStorage.setItem('claude_active_model', AppState.activeModel);
+                SafeStorage.setItem('claude_active_model', AppState.activeModel);
               }
               updateActiveModelUI();
               updateEndpointDisplay();
@@ -2687,9 +2797,9 @@ ${generatedHtml}
           const keyInput = document.getElementById('quick-input-api-key');
           const protoSelect = document.getElementById('quick-select-protocol');
 
-          if (urlInput) urlInput.value = AppState.vault.customBaseUrl || localStorage.getItem('claude_custom_base_url') || '';
-          if (keyInput) keyInput.value = AppState.vault.customApiKey || localStorage.getItem('claude_custom_api_key') || '';
-          if (protoSelect) protoSelect.value = AppState.vault.customFormat || localStorage.getItem('claude_custom_format') || 'openai';
+          if (urlInput) urlInput.value = AppState.vault.customBaseUrl || SafeStorage.getItem('claude_custom_base_url') || '';
+          if (keyInput) keyInput.value = AppState.vault.customApiKey || SafeStorage.getItem('claude_custom_api_key') || '';
+          if (protoSelect) protoSelect.value = AppState.vault.customFormat || SafeStorage.getItem('claude_custom_format') || 'openai';
         }
 
         function updateActiveModelUI() {
@@ -2747,7 +2857,7 @@ ${generatedHtml}
                 </div>
               </div>
             `;
-            lucide.createIcons();
+            refreshIcons();
             return;
           }
 
@@ -2759,7 +2869,7 @@ ${generatedHtml}
                 <button class="text-[#D97757] hover:underline" onclick="document.getElementById('search-models-input').value=''; renderModelsList();">Clear search</button>
               </div>
             `;
-            lucide.createIcons();
+            refreshIcons();
             return;
           }
 
@@ -2786,13 +2896,13 @@ ${generatedHtml}
             `;
           }).join('');
 
-          lucide.createIcons();
+          refreshIcons();
         }
 
         window.selectModel = function(modelId) {
           Haptics.tap();
           AppState.activeModel = modelId;
-          localStorage.setItem('claude_active_model', modelId);
+          SafeStorage.setItem('claude_active_model', modelId);
           updateActiveModelUI();
           renderModelsList(document.getElementById('search-models-input')?.value || '');
           closeBottomSheet('models');
@@ -2801,11 +2911,11 @@ ${generatedHtml}
         window.removeCustomModel = function(modelId) {
           Haptics.tap();
           AppState.customModels = AppState.customModels.filter(m => m.id !== modelId);
-          localStorage.setItem('claude_custom_models', JSON.stringify(AppState.customModels));
+          SafeStorage.setItem('claude_custom_models', JSON.stringify(AppState.customModels));
           if (AppState.activeModel === modelId) {
             const next = AppState.customModels[0]?.id || '';
             AppState.activeModel = next;
-            localStorage.setItem('claude_active_model', next);
+            SafeStorage.setItem('claude_active_model', next);
             updateActiveModelUI();
           }
           renderModelsList(document.getElementById('search-models-input')?.value || '');
@@ -2842,7 +2952,7 @@ ${generatedHtml}
           } else {
             AppState.customModels.unshift(newModel);
           }
-          localStorage.setItem('claude_custom_models', JSON.stringify(AppState.customModels));
+          SafeStorage.setItem('claude_custom_models', JSON.stringify(AppState.customModels));
           input.value = '';
           window.selectModel(id);
           renderModelsList();
@@ -2859,18 +2969,34 @@ ${generatedHtml}
           const chat = AppState.chats.find(c => c.id === AppState.currentChatId);
           if (!chat || chat.messages.length === 0) {
             list.innerHTML = '';
-            document.getElementById('empty-state').classList.remove('hidden');
+            document.getElementById('empty-state')?.classList.remove('hidden');
             return;
           }
-          document.getElementById('empty-state').classList.add('hidden');
+          document.getElementById('empty-state')?.classList.add('hidden');
 
           let html = '';
           chat.messages.forEach(msg => {
             if (msg.role === 'user') {
               html += `
                 <div class="flex justify-end msg-item" data-msg-id="${msg.id}">
-                  <div class="max-w-[85%] bg-[#242421] border border-[#33312B] rounded-2xl rounded-tr-sm px-4 py-2.5 text-[#F5F4F0] text-sm leading-relaxed select-text shadow-sm">
-                    ${escapeHtml(msg.content)}
+                  <div class="max-w-[85%] flex flex-col items-end gap-1.5">
+                    ${msg.attachments && msg.attachments.length > 0 ? `
+                      <div class="flex flex-wrap gap-1.5 justify-end">
+                        ${msg.attachments.map(att => att.mediaType && att.mediaType.startsWith('image') ? `
+                          <img src="${att.url || ('data:' + att.mediaType + ';base64,' + att.base64)}" class="max-w-xs max-h-48 rounded-2xl object-cover border border-[#33312B]" />
+                        ` : `
+                          <div class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#242421] border border-[#33312B] text-xs text-[#F5F4F0]">
+                            <i data-lucide="file-text" class="w-3.5 h-3.5 text-[#D97757]"></i>
+                            <span class="max-w-[150px] truncate">${escapeHtml(att.name || 'File')}</span>
+                          </div>
+                        `).join('')}
+                      </div>
+                    ` : ''}
+                    ${msg.content ? `
+                      <div class="bg-[#242421] border border-[#33312B] rounded-2xl rounded-tr-sm px-4 py-2.5 text-[#F5F4F0] text-sm leading-relaxed select-text shadow-sm">
+                        ${escapeHtml(msg.content)}
+                      </div>
+                    ` : ''}
                   </div>
                 </div>
               `;
@@ -2902,6 +3028,15 @@ ${generatedHtml}
                     </details>
                   `;
                 }
+              } else if (msg.isThinking && !msg.content) {
+                thinkingHtml = `
+                  <div class="mb-3 bg-[#242421] border border-[#3D3B35] rounded-xl p-3 text-xs space-y-1.5">
+                    <div class="flex items-center gap-2 text-[#D97757] font-medium">
+                      <span class="w-2 h-2 rounded-full bg-[#D97757] animate-pulse"></span>
+                      <span>Generating response...</span>
+                    </div>
+                  </div>
+                `;
               }
 
               // Tool Calls Inspector
@@ -2930,12 +3065,16 @@ ${generatedHtml}
                   <div class="mt-4 pt-3 border-t border-[#33312B]">
                     <div class="text-[11px] font-semibold text-[#9C9A92] uppercase tracking-wider mb-2">Sources Consulted</div>
                     <div class="flex gap-2 overflow-x-auto no-scrollbar pb-1">
-                      ${msg.sources.map(s => `
-                        <a href="${s.url}" target="_blank" rel="noopener noreferrer" class="flex-shrink-0 w-44 p-2.5 rounded-xl bg-[#242421] border border-[#33312B] text-left hover:border-[#3D3B35] active:scale-95 transition-all">
-                          <div class="font-medium text-xs text-[#F5F4F0] truncate">${escapeHtml(s.title)}</div>
-                          <div class="text-[10px] text-[#9C9A92] truncate mt-0.5">${new URL(s.url).hostname}</div>
-                        </a>
-                      `).join('')}
+                      ${msg.sources.map(s => {
+                        let hostname = 'source';
+                        try { hostname = new URL(s.url).hostname; } catch(_) {}
+                        return `
+                          <a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer" class="flex-shrink-0 w-44 p-2.5 rounded-xl bg-[#242421] border border-[#33312B] text-left hover:border-[#3D3B35] active:scale-95 transition-all">
+                            <div class="font-medium text-xs text-[#F5F4F0] truncate">${escapeHtml(s.title || s.url)}</div>
+                            <div class="text-[10px] text-[#9C9A92] truncate mt-0.5">${escapeHtml(hostname)}</div>
+                          </a>
+                        `;
+                      }).join('')}
                     </div>
                   </div>
                 `;
@@ -2980,7 +3119,7 @@ ${generatedHtml}
           });
 
           list.innerHTML = html;
-          lucide.createIcons();
+          refreshIcons();
           if (window.Prism) { Prism.highlightAll(); }
           renderMathEquations();
           setupLongPressHandlers();
@@ -3306,7 +3445,7 @@ ${generatedHtml}
               <span class="font-mono">${art.title}</span>
             </button>
           `).join('');
-          lucide.createIcons();
+          refreshIcons();
 
           const activeArt = AppState.artifacts[AppState.activeArtifactIndex];
           const codeEl = document.getElementById('artifact-code-content');
@@ -3399,7 +3538,7 @@ ${generatedHtml}
               </div>
             `).join('');
           }
-          lucide.createIcons();
+          refreshIcons();
         }
 
         window.selectChat = function(chatId) {
@@ -3459,13 +3598,13 @@ ${generatedHtml}
           const apiInput = document.getElementById('key-custom-api');
           const fmtInput = document.getElementById('custom-protocol-format');
 
-          if (antInput) antInput.value = AppState.vault.anthropicKey || localStorage.getItem('claude_anthropic_key') || '';
-          if (oaiInput) oaiInput.value = AppState.vault.openaiKey || localStorage.getItem('claude_openai_key') || '';
-          if (ghInput) ghInput.value = AppState.vault.githubKey || localStorage.getItem('claude_github_key') || '';
-          if (srInput) srInput.value = AppState.vault.searchKey || localStorage.getItem('claude_search_key') || '';
-          if (urlInput) urlInput.value = AppState.vault.customBaseUrl || localStorage.getItem('claude_custom_base_url') || '';
-          if (apiInput) apiInput.value = AppState.vault.customApiKey || localStorage.getItem('claude_custom_api_key') || '';
-          if (fmtInput) fmtInput.value = AppState.vault.customFormat || localStorage.getItem('claude_custom_format') || 'openai';
+          if (antInput) antInput.value = AppState.vault.anthropicKey || SafeStorage.getItem('claude_anthropic_key') || '';
+          if (oaiInput) oaiInput.value = AppState.vault.openaiKey || SafeStorage.getItem('claude_openai_key') || '';
+          if (ghInput) ghInput.value = AppState.vault.githubKey || SafeStorage.getItem('claude_github_key') || '';
+          if (srInput) srInput.value = AppState.vault.searchKey || SafeStorage.getItem('claude_search_key') || '';
+          if (urlInput) urlInput.value = AppState.vault.customBaseUrl || SafeStorage.getItem('claude_custom_base_url') || '';
+          if (apiInput) apiInput.value = AppState.vault.customApiKey || SafeStorage.getItem('claude_custom_api_key') || '';
+          if (fmtInput) fmtInput.value = AppState.vault.customFormat || SafeStorage.getItem('claude_custom_format') || 'openai';
 
           const hasAnyKey = AppState.vault.anthropicKey || AppState.vault.openaiKey || AppState.vault.customApiKey;
           const statusInd = document.getElementById('vault-status-indicator');
@@ -3586,7 +3725,7 @@ ${generatedHtml}
           t.className = 'fixed top-14 left-1/2 -translate-x-1/2 z-50 bg-[#2A2926] border border-[#3D3B35] text-[#F5F4F0] px-4 py-1.5 rounded-full text-xs shadow-2xl transition-all duration-300 pointer-events-none flex items-center gap-1.5';
           t.innerHTML = `<i data-lucide="check-circle-2" class="w-3.5 h-3.5 text-emerald-400"></i><span>${msg}</span>`;
           document.body.appendChild(t);
-          lucide.createIcons();
+          refreshIcons();
           setTimeout(() => {
             t.style.opacity = '0';
             t.style.transform = 'translate(-50%, -10px)';
@@ -3622,7 +3761,7 @@ ${generatedHtml}
         function setTheme(themeName, save = true) {
           AppState.theme = themeName;
           if (save) {
-            localStorage.setItem('claude_theme', themeName);
+            SafeStorage.setItem('claude_theme', themeName);
           }
           const body = document.body;
           const themeIcon = document.getElementById('theme-icon');
@@ -3643,7 +3782,7 @@ ${generatedHtml}
             if (darkBtn) darkBtn.className = 'flex-1 py-2 rounded-xl border-2 border-[#D97757] bg-[#181817] text-[#F5F4F0] text-xs font-semibold flex items-center justify-center gap-1.5 transition-all';
             if (whiteBtn) whiteBtn.className = 'flex-1 py-2 rounded-xl border border-[#33312B] bg-[#181817] text-[#9C9A92] text-xs flex items-center justify-center gap-1.5 transition-all';
           }
-          if (window.lucide) lucide.createIcons();
+          if (window.lucide) refreshIcons();
         }
 
         function toggleTheme() {
@@ -3673,7 +3812,7 @@ ${generatedHtml}
         function toggleChatWebSearch() {
           Haptics.tap();
           AppState.webSearchEnabled = !AppState.webSearchEnabled;
-          localStorage.setItem('claude_web_search_enabled', AppState.webSearchEnabled ? 'true' : 'false');
+          SafeStorage.setItem('claude_web_search_enabled', AppState.webSearchEnabled ? 'true' : 'false');
           updateChatWebSearchUI();
           alertUserToast(AppState.webSearchEnabled ? 'Web Search ON for Chat' : 'Web Search OFF');
         }
@@ -3707,7 +3846,7 @@ ${generatedHtml}
         function setChatThinkingBudget(budget) {
           Haptics.tap();
           AppState.thinkingBudget = budget;
-          localStorage.setItem('claude_thinking_budget', budget);
+          SafeStorage.setItem('claude_thinking_budget', budget);
           updateChatThinkingUI();
           const popover = document.getElementById('popover-thinking-presets') || document.getElementById('thinking-presets-popover');
           if (popover) popover.classList.add('hidden');
@@ -3754,11 +3893,11 @@ ${generatedHtml}
           }
 
           if (save) {
-            localStorage.setItem('claude_context_mode', mode);
-            localStorage.setItem('claude_context_window', AppState.contextWindowLimit);
-            localStorage.setItem('claude_max_tokens', AppState.maxTokens);
-            localStorage.setItem('claude_temp', AppState.temperature);
-            localStorage.setItem('claude_thinking_budget', AppState.thinkingBudget);
+            SafeStorage.setItem('claude_context_mode', mode);
+            SafeStorage.setItem('claude_context_window', AppState.contextWindowLimit);
+            SafeStorage.setItem('claude_max_tokens', AppState.maxTokens);
+            SafeStorage.setItem('claude_temp', AppState.temperature);
+            SafeStorage.setItem('claude_thinking_budget', AppState.thinkingBudget);
           }
 
           // Update chat page 4-mode button styles
@@ -3805,9 +3944,9 @@ ${generatedHtml}
           AppState.vault.customApiKey = key;
           AppState.vault.customFormat = proto;
 
-          localStorage.setItem('claude_custom_base_url', url);
-          localStorage.setItem('claude_custom_api_key', key);
-          localStorage.setItem('claude_custom_format', proto);
+          SafeStorage.setItem('claude_custom_base_url', url);
+          SafeStorage.setItem('claude_custom_api_key', key);
+          SafeStorage.setItem('claude_custom_format', proto);
 
           // Keep settings inputs synchronized
           const settingsUrl = document.getElementById('key-custom-base-url');
@@ -3849,9 +3988,9 @@ ${generatedHtml}
           AppState.vault.customBaseUrl = url;
           AppState.vault.customApiKey = key;
           AppState.vault.customFormat = proto;
-          localStorage.setItem('claude_custom_base_url', url);
-          localStorage.setItem('claude_custom_api_key', key);
-          localStorage.setItem('claude_custom_format', proto);
+          SafeStorage.setItem('claude_custom_base_url', url);
+          SafeStorage.setItem('claude_custom_api_key', key);
+          SafeStorage.setItem('claude_custom_format', proto);
 
           try {
             await extractAllModels('settings');
@@ -3873,13 +4012,17 @@ ${generatedHtml}
         // ==========================================
         // 19. VIEWPORT & EVENT LISTENERS
         // ==========================================
-        document.addEventListener('DOMContentLoaded', async () => {
-          await initIndexedDB();
-          const loadedChats = await loadAllChatsFromDB();
-          if (loadedChats.length > 0) {
-            AppState.chats = loadedChats;
-            AppState.currentChatId = loadedChats[0].id;
-          }
+        async function initApp() {
+          try {
+            await initIndexedDB();
+          } catch(e) { console.warn('IDB init:', e); }
+          try {
+            const loadedChats = await loadAllChatsFromDB();
+            if (loadedChats && loadedChats.length > 0) {
+              AppState.chats = loadedChats;
+              AppState.currentChatId = loadedChats[0].id;
+            }
+          } catch(e) { console.warn('Load chats:', e); }
 
           // Initialize Custom Base URL & Models
           if (document.getElementById('key-custom-base-url')) {
@@ -3907,8 +4050,8 @@ ${generatedHtml}
               if (fmtSelect && fmt) fmtSelect.value = fmt;
               AppState.vault.customBaseUrl = url;
               if (fmt) AppState.vault.customFormat = fmt;
-              localStorage.setItem('claude_custom_base_url', url);
-              if (fmt) localStorage.setItem('claude_custom_format', fmt);
+              SafeStorage.setItem('claude_custom_base_url', url);
+              if (fmt) SafeStorage.setItem('claude_custom_format', fmt);
               updateEndpointDisplay();
               alertUserToast(`Preset: ${btn.textContent}`);
             });
@@ -4080,13 +4223,13 @@ ${generatedHtml}
             AppState.vault.customApiKey = customApi;
             AppState.vault.customFormat = customFormat;
 
-            localStorage.setItem('claude_anthropic_key', ant);
-            localStorage.setItem('claude_openai_key', oai);
-            localStorage.setItem('claude_github_key', gh);
-            localStorage.setItem('claude_search_key', sr);
-            localStorage.setItem('claude_custom_base_url', customUrl);
-            localStorage.setItem('claude_custom_api_key', customApi);
-            localStorage.setItem('claude_custom_format', customFormat);
+            SafeStorage.setItem('claude_anthropic_key', ant);
+            SafeStorage.setItem('claude_openai_key', oai);
+            SafeStorage.setItem('claude_github_key', gh);
+            SafeStorage.setItem('claude_search_key', sr);
+            SafeStorage.setItem('claude_custom_base_url', customUrl);
+            SafeStorage.setItem('claude_custom_api_key', customApi);
+            SafeStorage.setItem('claude_custom_format', customFormat);
 
             const hasAnyKey = ant || oai || customApi;
             const statusInd = document.getElementById('vault-status-indicator');
@@ -4105,20 +4248,30 @@ ${generatedHtml}
           const inputArea = document.getElementById('chat-input');
           const sendBtn = document.getElementById('btn-send');
 
-          sendBtn?.addEventListener('click', () => {
+          function triggerSend() {
             if (!inputArea) return;
             const text = inputArea.value;
+            if (!text.trim() && AppState.currentAttachments.length === 0 && !AppState.activeStreams.has(AppState.currentChatId)) {
+              return;
+            }
             inputArea.value = '';
             inputArea.style.height = 'auto';
             sendUserPrompt(text);
+          }
+
+          sendBtn?.addEventListener('click', (e) => {
+            e.preventDefault();
+            triggerSend();
           });
 
           inputArea?.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
-              sendBtn?.click();
+              triggerSend();
             }
           });
+
+          window.sendUserPrompt = sendUserPrompt;
 
           // Auto-grow textarea
           inputArea?.addEventListener('input', () => {
@@ -4218,11 +4371,52 @@ ${generatedHtml}
           });
 
           // PDF / File Uploads
-          document.getElementById('file-doc-input')?.addEventListener('change', (e) => {
+          document.getElementById('file-doc-input')?.addEventListener('change', async (e) => {
             const file = e.target.files?.[0];
             if (file) {
               closeBottomSheet('attach');
-              handlePdfUpload(file);
+              if (file.name.toLowerCase().endsWith('.pdf')) {
+                handlePdfUpload(file);
+              } else {
+                try {
+                  const text = await file.text();
+                  const input = document.getElementById('chat-input');
+                  if (input) {
+                    input.value += (input.value ? '\n' : '') + `[File: ${file.name}]\n\`\`\`\n${text.slice(0, 3000)}\n\`\`\`\n`;
+                    input.style.height = 'auto';
+                    input.style.height = Math.min(input.scrollHeight, 140) + 'px';
+                  }
+                  alertUserToast('Loaded ' + file.name);
+                } catch (err) {
+                  alertUserToast('Could not read file: ' + err.message);
+                }
+              }
+              e.target.value = '';
+            }
+          });
+
+          // Photo / Image Uploads
+          document.getElementById('file-img-input')?.addEventListener('change', (e) => {
+            const file = e.target.files?.[0];
+            if (file) {
+              closeBottomSheet('attach');
+              const reader = new FileReader();
+              reader.onload = (evt) => {
+                const res = evt.target.result;
+                const base64 = typeof res === 'string' ? res.split(',')[1] : '';
+                const mediaType = file.type || 'image/jpeg';
+                AppState.currentAttachments.push({
+                  id: 'att-' + Date.now(),
+                  name: file.name,
+                  base64,
+                  mediaType,
+                  url: res
+                });
+                renderAttachmentPreviews();
+                alertUserToast(`Attached ${file.name}`);
+              };
+              reader.readAsDataURL(file);
+              e.target.value = '';
             }
           });
 
@@ -4391,9 +4585,9 @@ ${generatedHtml}
             AppState.temperature = tempVal;
             AppState.maxTokens = maxVal;
 
-            localStorage.setItem('claude_context_window', ctxVal);
-            localStorage.setItem('claude_temp', tempVal);
-            localStorage.setItem('claude_max_tokens', maxVal);
+            SafeStorage.setItem('claude_context_window', ctxVal);
+            SafeStorage.setItem('claude_temp', tempVal);
+            SafeStorage.setItem('claude_max_tokens', maxVal);
 
             const ctxLabel = document.getElementById('context-limit-label');
             if (ctxLabel) {
@@ -4446,8 +4640,14 @@ ${generatedHtml}
           renderHistoryDrawer();
           renderArtifactsView();
           renderDiffViewer();
-          lucide.createIcons();
-        });
+          refreshIcons();
+        }
+
+        if (document.readyState === 'loading') {
+          document.addEventListener('DOMContentLoaded', initApp);
+        } else {
+          initApp();
+        }
 
         function switchView(viewName) {
           AppState.activeView = viewName;
