@@ -1,0 +1,6 @@
+{
+  "name": "Claude Mobile AI Workbench",
+  "description": "Offline-first BYOK AI workbench replicating Claude mobile design with multi-provider reasoning, GitHub DevOps, and web search.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
